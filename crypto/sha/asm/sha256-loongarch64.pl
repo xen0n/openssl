@@ -42,6 +42,9 @@ use warnings;
 my $output = $#ARGV >= 0 && $ARGV[$#ARGV] =~ m|\.\w+$| ? pop : undef;
 my $flavour = $#ARGV >= 0 && $ARGV[0] !~ m|\.| ? shift : undef;
 
+my $use_lsx = $flavour && $flavour =~ /lsx/i ? 1 : 0;
+my $isaext = "_" . ( $use_lsx ? "lsx" : "la64v100" );
+
 $output and open STDOUT,">$output";
 
 my $code=<<___;
@@ -49,16 +52,21 @@ my $code=<<___;
 ___
 
 my $K256 = "K256";
+my $ALIGN_CTRL = "ALIGN_CTRL";
 
 # Function arguments
 my ($zero,$ra,$tp,$sp,$fp)=("\$zero", "\$ra", "\$tp", "\$sp", "\$fp");
 my ($a0,$a1,$a2,$a3,$a4,$a5,$a6,$a7)=map("\$a$_",(0..7));
 my ($t0,$t1,$t2,$t3,$t4,$t5,$t6,$t7,$t8)=map("\$t$_",(0..8));
 my ($s0,$s1,$s2,$s3,$s4,$s5,$s6,$s7,$s8)=map("\$s$_",(0..8));
+my ($va0, $va1, $va2, $va3, $va4, $va5, $va6, $va7) = map("\$vr$_",(0..7));
+my ($vt0, $vt1, $vt2, $vt3, $vt4, $vt5, $vt6, $vt7) = map("\$vr$_",(8..15));
 
 my ($INP, $LEN, $ADDR) = ($a1, $a2, $sp);
 my ($KT, $T1, $T2, $T3, $T4, $T5, $T6) = ($t0, $t1, $t2, $t3, $t4, $t5, $t6);
 my ($A, $B, $C, $D, $E, $F, $G, $H) = ($s0, $s1, $s2, $s3, $s4, $s5, $s6, $s7);
+my @VMSGS = ($va0, $va1, $va2, $va3);
+my $VALIGN = $vt7;
 
 sub strip {
     my ($str) = @_;
@@ -66,18 +74,110 @@ sub strip {
     return $str;
 }
 
+sub MSGSCHEDULE0_lsx {
+    my ($index) = @_;
+    my $msg = $VMSGS[$index / 4];
+    my $code;
+
+    if ($index % 4 == 0) {
+        $code = <<___;
+    vld $msg, $INP, @{[4*$index]}
+    vshuf4i.b $msg, $msg, 0b00011011
+___
+    }
+
+    $code .= <<___;
+    vpickve2gr.w $T1, $msg, @{[$index%4]}
+___
+
+    return strip($code);
+}
+
 sub MSGSCHEDULE0 {
     my ($index) = @_;
+
+    if ($use_lsx) {
+        return MSGSCHEDULE0_lsx($index);
+    }
+
     my $code=<<___;
     ld.w $T1, $INP, @{[4*$index]}
     revb.2w $T1, $T1
     st.w $T1, $ADDR, @{[4*$index]}
 ___
+
+    return strip($code);
+}
+
+sub MSGSCHEDULE1_lsx {
+    my ($index) = @_;
+    my $msgidx = ($index / 4) % 4;
+    my $m0123 = $VMSGS[$msgidx];
+    my $m4567 = $VMSGS[($msgidx + 1) % 4];
+    my $m89ab = $VMSGS[($msgidx + 2) % 4];
+    my $mcdef = $VMSGS[($msgidx + 3) % 4];
+    my ($m1234, $tmp0, $tmp1) = ($vt0, $vt1, $vt2);
+    my $code;
+
+    if ($index % 4 == 0) {
+        # re-align to get $m1234 and "$m9abc" ($tmp0)
+        $code = <<___;
+    # m0123 & new = $m0123, m4567 = $m4567, m89ab = $m89ab, mcdef = $mcdef
+    vori.b $m1234, $VALIGN, 0
+    vshuf.w $m1234, $m4567, $m0123
+    vori.b $tmp0, $VALIGN, 0
+    vshuf.w $tmp0, $mcdef, $m89ab
+    vadd.w $m0123, $m0123, $tmp0
+___
+
+        # $m0123 += sigma0($m1234)
+        $code .= <<___;
+    vrotri.w $tmp0, $m1234, 7
+    vrotri.w $tmp1, $m1234, 18
+    vsrli.w $m1234, $m1234, 3
+    vxor.v $tmp0, $tmp0, $tmp1
+    vxor.v $m1234, $m1234, $tmp0
+    vadd.w $m0123, $m0123, $m1234
+___
+
+        # 1st half of sigma1, finalize new 01
+        # now m1234 can be re-used as temporary
+        $code .= <<___;
+    vrotri.w $tmp0, $mcdef, 17
+    vrotri.w $tmp1, $mcdef, 19
+    vsrli.w $m1234, $mcdef, 10
+    vxor.v $tmp0, $tmp0, $tmp1
+    vxor.v $m1234, $m1234, $tmp0  # sigma1(cdef)
+    vbsrl.v $m1234, $m1234, 8  # sigma1(ef) & zeroes
+    vadd.w $m0123, $m0123, $m1234
+___
+
+        # 2nd half of sigma1, finalize new 23
+        $code .= <<___;
+    vrotri.w $tmp0, $m0123, 17
+    vrotri.w $tmp1, $m0123, 19
+    vsrli.w $m1234, $m0123, 10
+    vxor.v $tmp0, $tmp0, $tmp1
+    vxor.v $m1234, $m1234, $tmp0  # sigma1(01xx)
+    vbsll.v $m1234, $m1234, 8  # zeroes & sigma1(01)
+    vadd.w $m0123, $m0123, $m1234
+___
+    }
+
+    $code .= <<___;
+    vpickve2gr.w $T1, $m0123, @{[$index%4]}
+___
+
     return strip($code);
 }
 
 sub MSGSCHEDULE1 {
     my ($index) = @_;
+
+    if ($use_lsx) {
+        return MSGSCHEDULE1_lsx($index);
+    }
+
     my $code=<<___;
     ld.w $T1, $ADDR, @{[(($index-2)&0x0f)*4]}
     ld.w $T2, $ADDR, @{[(($index-15)&0x0f)*4]}
@@ -152,12 +252,12 @@ ___
 }
 
 ################################################################################
-# void sha256_block_data_order(void *c, const void *p, size_t len)
+# void sha256_block_data_order$isaext(void *c, const void *p, size_t len)
 $code .= <<___;
 .p2align 3
-.globl sha256_block_data_order
-.type   sha256_block_data_order,\@function
-sha256_block_data_order:
+.globl sha256_block_data_order@{[$isaext]}
+.type   sha256_block_data_order@{[$isaext]},\@function
+sha256_block_data_order@{[$isaext]}:
 
     addi.d $sp, $sp, -80
 
@@ -171,9 +271,20 @@ sha256_block_data_order:
     st.d $s7, $sp, 56
     st.d $s8, $sp, 64
     st.d $fp, $sp, 72
+___
 
+if ($use_lsx) {
+    $code .= <<___;
+    la $KT, $ALIGN_CTRL
+    vld $VALIGN, $KT, 0
+___
+} else {
+    $code .= <<___;
     addi.d $sp, $sp, -64
+___
+}
 
+$code .= <<___;
     la $KT, $K256
 
     # load ctx
@@ -238,9 +349,15 @@ $code .= <<___;
     addi.d $INP, $INP, 64
 
     bnez $LEN, L_round_loop
+___
 
+if (!$use_lsx) {
+    $code .= <<___;
     addi.d $sp, $sp, 64
+___
+}
 
+$code .= <<___;
     ld.d $s0, $sp, 0
     ld.d $s1, $sp, 8
     ld.d $s2, $sp, 16
@@ -255,7 +372,7 @@ $code .= <<___;
     addi.d $sp, $sp, 80
 
     ret
-.size sha256_block_data_order,.-sha256_block_data_order
+.size sha256_block_data_order@{[$isaext]},.-sha256_block_data_order@{[$isaext]}
 
 .section .rodata
 .p2align 3
@@ -278,6 +395,11 @@ $K256:
     .word 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208
     .word 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
 .size $K256,.-$K256
+
+.type $ALIGN_CTRL,\@object
+$ALIGN_CTRL:
+    .word 1, 2, 3, 4
+.size $ALIGN_CTRL,.-$ALIGN_CTRL
 ___
 
 print $code;
